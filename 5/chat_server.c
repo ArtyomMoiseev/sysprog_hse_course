@@ -5,32 +5,51 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/event.h>
+#include <stdio.h>
+#include <sys/socket.h>
+#include <netdb.h>
+#include <fcntl.h>
+#include <arpa/inet.h>
+
+struct message {
+    char *data;
+    struct message *next;
+};
 
 struct chat_peer {
 	/** Client's socket. To read/write messages. */
 	int socket;
 	/** Output buffer. */
-	/* ... */
-	/* PUT HERE OTHER MEMBERS */
+	char out_buff[1024];
+    size_t out_buff_size;
+
+    char recv_buff[1024];
+    size_t recv_buff_size;
 };
 
 struct chat_server {
 	/** Listening socket. To accept new clients. */
 	int socket;
+    int kq;
 	/** Array of peers. */
-	/* ... */
-	/* PUT HERE OTHER MEMBERS */
+	struct chat_peer *peers;
+    size_t peers_count;
+
+    struct message *messages_head;
+    struct message *messages_tail;
+
+    int is_listen;
 };
 
 struct chat_server *
 chat_server_new(void)
 {
 	struct chat_server *server = calloc(1, sizeof(*server));
-	server->socket = -1;
 
-	/* IMPLEMENT THIS FUNCTION */
-
-	return server;
+    server->socket = -1;
+    server->kq = kqueue();
+    return server;
 }
 
 void
@@ -39,7 +58,29 @@ chat_server_delete(struct chat_server *server)
 	if (server->socket >= 0)
 		close(server->socket);
 
-	/* IMPLEMENT THIS FUNCTION */
+    if (server->socket >= 0) {
+        close(server->socket);
+        server->socket = -1;
+    }
+
+    if (server->kq >= 0) {
+        close(server->kq);
+        server->kq = -1;
+    }
+
+    for (size_t i = 0; i < server->peers_count; i++) {
+        struct chat_peer *p = &server->peers[i];
+        close(p->socket);
+    }
+    free(server->peers);
+
+    struct message *m = server->messages_head;
+    while (m) {
+        struct message *tmp = m->next;
+        free(m->data);
+        free(m);
+        m = tmp;
+    }
 
 	free(server);
 }
@@ -53,16 +94,75 @@ chat_server_listen(struct chat_server *server, uint16_t port)
 	/* Listen on all IPs of this machine. */
 	addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-	/*
-	 * 1) Create a server socket (function socket()).
-	 * 2) Bind the server socket to addr (function bind()).
-	 * 3) Listen the server socket (function listen()).
-	 * 4) Create epoll/kqueue if needed.
-	 */
-	/* IMPLEMENT THIS FUNCTION */
-	(void)server;
+	if (!server) {
+        return CHAT_ERR_SYS;
+    }
+    if (server->is_listen) {
+        return CHAT_ERR_ALREADY_STARTED;
+    }
 
-	return CHAT_ERR_NOT_IMPLEMENTED;
+    int srv_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (srv_fd < 0) {
+        return CHAT_ERR_SYS;
+    }
+
+    int opt = 1;
+    setsockopt(srv_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(opt = 1);
+    setsockopt(srv_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family      = AF_INET;
+    addr.sin_port        = htons(port);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+    if (bind(srv_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+
+        close(srv_fd);
+        return CHAT_ERR_SYS;
+    }
+
+    if (listen(srv_fd, 128) < 0) {
+        close(srv_fd);
+        return CHAT_ERR_SYS;
+    }
+
+    server->socket = srv_fd;
+    server->is_listen = 1;
+
+    struct kevent evset;
+    EV_SET(&evset, srv_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(server->kq, &evset, 1, NULL, 0, NULL) < 0) {
+        close(srv_fd);
+        server->socket = -1;
+        server->is_listen = 0;
+        return CHAT_ERR_SYS;
+    }
+
+    return 0;
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+
+
+    if (listen(srv_fd, 128) < 0) {
+        close(srv_fd);
+        return CHAT_ERR_SYS;
+    }
+
+    server->socket = srv_fd;
+    server->is_listen = 1;
+
+    EV_SET(&evset, srv_fd, EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, NULL);
+    if (kevent(server->kq, &evset, 1, NULL, 0, NULL) < 0) {
+        close(srv_fd);
+        server->socket = -1;
+        server->is_listen = 0;
+        return CHAT_ERR_SYS;
+    }
+
+    return 0;
 }
 
 struct chat_message *
@@ -84,9 +184,33 @@ chat_server_update(struct chat_server *server, double timeout)
 	 * 2.2) If the update was on a client-socket, then you might want to
 	 *     read/write on it.
 	 */
-	(void)server;
-	(void)timeout;
-	return CHAT_ERR_NOT_IMPLEMENTED;
+        if (!server)
+          return CHAT_ERR_SYS;
+
+    struct kevent events[64];
+    struct timespec ts;
+    if (timeout >= 0) {
+        ts.tv_sec  = (time_t)timeout;
+        ts.tv_nsec = (long)((timeout - ts.tv_sec) * 1e9);
+    }
+
+    int nev = kevent(server->kq, NULL, 0, events, 64,
+                     (timeout >= 0 ? &ts : NULL));
+
+    for (int i = 0; i < nev; i++) {
+        struct kevent *kev = &events[i];
+
+        if (kev->ident == (uintptr_t)server->socket) {
+            if (kev->filter == EVFILT_READ) {
+                printf("chat_server_event socker=%d\n", server->socket);
+            }
+        }
+        else {
+          printf("chat_server_event socker=%d\n", server->socket);
+        }
+    }
+
+    return 0;
 }
 
 int
