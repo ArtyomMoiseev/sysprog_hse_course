@@ -80,12 +80,13 @@ static void *worker_thread(void *arg)
             pthread_mutex_lock(&task->mutex);
             task->result = ret;
             task->status = TASK_FINISHED;
-            pthread_cond_broadcast(&task->done);
-            pthread_mutex_unlock(&task->mutex);
 
             pthread_mutex_lock(&pool->pool_mutex);
             pool->active_tasks--;
             pthread_mutex_unlock(&pool->pool_mutex);
+
+            pthread_cond_broadcast(&task->done);
+            pthread_mutex_unlock(&task->mutex);
         }
     }
     return NULL;
